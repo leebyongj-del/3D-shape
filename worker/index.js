@@ -20,6 +20,15 @@ function validSession(value) {
   return typeof value === "string" && /^\d{8}$/.test(value);
 }
 
+function teacherAuthorized(request, env) {
+  const provided = request.headers.get("x-teacher-code") || "";
+  return Boolean(env.TEACHER_CODE) && provided === env.TEACHER_CODE;
+}
+
+function requireTeacher(request, env) {
+  return teacherAuthorized(request, env) ? null : json({ error: "교사용 번호를 확인해 주세요." }, 401);
+}
+
 async function saveResponse(request, env) {
   let body;
   try { body = await request.json(); } catch { return json({ error: "요청 형식을 확인해 주세요." }, 400); }
@@ -60,12 +69,58 @@ async function getResponses(url, env) {
   return json({ responses, summary: { groups: groups.length, submissions: responses.length, correct } });
 }
 
+async function deleteResponses(url, env) {
+  const sessionKey = url.searchParams.get("session") || "";
+  if (!validSession(sessionKey)) return json({ error: "수업 날짜를 확인해 주세요." }, 400);
+  const result = await env.DB.prepare("DELETE FROM responses WHERE session_key = ?").bind(sessionKey).run();
+  return json({ deleted: true, changes: result.meta?.changes || 0 });
+}
+
+async function getClassState(url, env) {
+  const sessionKey = url.searchParams.get("session") || "";
+  if (!validSession(sessionKey)) return json({ error: "수업 날짜를 확인해 주세요." }, 400);
+  const row = await env.DB.prepare("SELECT active_stage AS activeStage, updated_at AS updatedAt FROM class_state WHERE session_key = ?").bind(sessionKey).first();
+  return json(row || { activeStage: 1, updatedAt: null });
+}
+
+async function setClassState(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "요청 형식을 확인해 주세요." }, 400); }
+  const sessionKey = String(body.sessionKey || "");
+  const activeStage = Number(body.activeStage);
+  if (!validSession(sessionKey) || !Number.isInteger(activeStage) || activeStage < 1 || activeStage > 4) {
+    return json({ error: "공개할 단계를 확인해 주세요." }, 400);
+  }
+  const updatedAt = new Date().toISOString();
+  await env.DB.prepare(`
+    INSERT INTO class_state (session_key, active_stage, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(session_key) DO UPDATE SET active_stage = excluded.active_stage, updated_at = excluded.updated_at
+  `).bind(sessionKey, activeStage, updatedAt).run();
+  return json({ activeStage, updatedAt });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     try {
       if (url.pathname === "/api/responses" && request.method === "POST") return await saveResponse(request, env);
-      if (url.pathname === "/api/responses" && request.method === "GET") return await getResponses(url, env);
+      if (url.pathname === "/api/teacher/verify" && request.method === "POST") {
+        const denied = requireTeacher(request, env);
+        return denied || json({ verified: true });
+      }
+      if (url.pathname === "/api/responses" && request.method === "GET") {
+        const denied = requireTeacher(request, env);
+        return denied || await getResponses(url, env);
+      }
+      if (url.pathname === "/api/responses" && request.method === "DELETE") {
+        const denied = requireTeacher(request, env);
+        return denied || await deleteResponses(url, env);
+      }
+      if (url.pathname === "/api/class-state" && request.method === "GET") return await getClassState(url, env);
+      if (url.pathname === "/api/class-state" && request.method === "POST") {
+        const denied = requireTeacher(request, env);
+        return denied || await setClassState(request, env);
+      }
       if (url.pathname === "/qr-code.png" && request.method === "GET") {
         const bytes = Uint8Array.from(atob(QR_PLACEHOLDER), (c) => c.charCodeAt(0));
         return new Response(bytes, { headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" } });

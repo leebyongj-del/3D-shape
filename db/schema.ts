@@ -13,3 +13,9 @@ export const responses = sqliteTable("responses", {
   sessionGroupActivity: uniqueIndex("idx_responses_session_group_activity").on(table.sessionKey, table.groupNo, table.activity),
   sessionUpdated: index("idx_responses_session_updated").on(table.sessionKey, table.updatedAt),
 }));
+
+export const classState = sqliteTable("class_state", {
+  sessionKey: text("session_key").primaryKey(),
+  activeStage: integer("active_stage").notNull().default(1),
+  updatedAt: text("updated_at").notNull(),
+});
