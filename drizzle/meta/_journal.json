@@ -15,6 +15,13 @@
       "when": 1790680800000,
       "tag": "0001_class_state",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1790683200000,
+      "tag": "0002_class_sessions",
+      "breakpoints": true
     }
   ]
 }

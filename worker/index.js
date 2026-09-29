@@ -17,7 +17,68 @@ function json(data, status = 200) {
 }
 
 function validSession(value) {
-  return typeof value === "string" && /^\d{8}$/.test(value);
+  return typeof value === "string" && /^\d{8}(?:-[a-z0-9]{6})?$/.test(value);
+}
+
+function todaySessionKey() {
+  return new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit" })
+    .format(new Date()).replaceAll("-", "");
+}
+
+async function currentSession(env) {
+  const row = await env.DB.prepare(`
+    SELECT session_key AS sessionKey, label, created_at AS createdAt
+    FROM class_sessions WHERE is_active = 1
+    ORDER BY updated_at DESC LIMIT 1
+  `).first();
+  return row || { sessionKey: todaySessionKey(), label: "오늘 기본 회차", createdAt: null };
+}
+
+async function listSessions(env) {
+  const result = await env.DB.prepare(`
+    SELECT session_key AS sessionKey, label, is_active AS isActive, created_at AS createdAt
+    FROM class_sessions ORDER BY created_at DESC LIMIT 30
+  `).all();
+  const sessions = result.results || [];
+  const fallbackKey = todaySessionKey();
+  if (!sessions.some((row) => row.sessionKey === fallbackKey)) {
+    sessions.push({ sessionKey: fallbackKey, label: "오늘 기본 회차", isActive: sessions.length ? 0 : 1, createdAt: null });
+  }
+  return { current: await currentSession(env), sessions };
+}
+
+async function createSession(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "요청 형식을 확인해 주세요." }, 400); }
+  const label = String(body.label || "").trim().replace(/\s+/g, " ").slice(0, 40);
+  if (label.length < 2) return json({ error: "수업 회차 이름을 두 글자 이상 입력해 주세요." }, 400);
+  const sessionKey = `${todaySessionKey()}-${crypto.randomUUID().replaceAll("-", "").slice(0, 6)}`;
+  const now = new Date().toISOString();
+  await env.DB.batch([
+    env.DB.prepare("UPDATE class_sessions SET is_active = 0, updated_at = ? WHERE is_active = 1").bind(now),
+    env.DB.prepare("INSERT INTO class_sessions (session_key, label, is_active, created_at, updated_at) VALUES (?, ?, 1, ?, ?)").bind(sessionKey, label, now, now),
+  ]);
+  return json({ session: { sessionKey, label, createdAt: now } }, 201);
+}
+
+async function activateSession(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "요청 형식을 확인해 주세요." }, 400); }
+  const sessionKey = String(body.sessionKey || "");
+  if (!validSession(sessionKey)) return json({ error: "수업 회차를 확인해 주세요." }, 400);
+  const existing = await env.DB.prepare("SELECT label, created_at AS createdAt FROM class_sessions WHERE session_key = ?").bind(sessionKey).first();
+  const now = new Date().toISOString();
+  const label = existing?.label || (sessionKey === todaySessionKey() ? "오늘 기본 회차" : "");
+  if (!label) return json({ error: "수업 회차를 찾지 못했습니다." }, 404);
+  await env.DB.batch([
+    env.DB.prepare("UPDATE class_sessions SET is_active = 0, updated_at = ? WHERE is_active = 1").bind(now),
+    env.DB.prepare(`
+      INSERT INTO class_sessions (session_key, label, is_active, created_at, updated_at)
+      VALUES (?, ?, 1, ?, ?)
+      ON CONFLICT(session_key) DO UPDATE SET is_active = 1, updated_at = excluded.updated_at
+    `).bind(sessionKey, label, existing?.createdAt || now, now),
+  ]);
+  return json({ session: { sessionKey, label, createdAt: existing?.createdAt || now } });
 }
 
 function teacherAuthorized(request, env) {
@@ -103,6 +164,19 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     try {
+      if (url.pathname === "/api/session" && request.method === "GET") return json(await currentSession(env));
+      if (url.pathname === "/api/sessions" && request.method === "GET") {
+        const denied = requireTeacher(request, env);
+        return denied || json(await listSessions(env));
+      }
+      if (url.pathname === "/api/sessions" && request.method === "POST") {
+        const denied = requireTeacher(request, env);
+        return denied || await createSession(request, env);
+      }
+      if (url.pathname === "/api/sessions" && request.method === "PATCH") {
+        const denied = requireTeacher(request, env);
+        return denied || await activateSession(request, env);
+      }
       if (url.pathname === "/api/responses" && request.method === "POST") return await saveResponse(request, env);
       if (url.pathname === "/api/teacher/verify" && request.method === "POST") {
         const denied = requireTeacher(request, env);

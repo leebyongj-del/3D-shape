@@ -13,4 +13,5 @@ fs.mkdirSync(path.join(dist, "server"), { recursive: true });
 fs.mkdirSync(path.join(dist, ".openai"), { recursive: true });
 fs.writeFileSync(path.join(dist, "server", "index.js"), worker);
 fs.copyFileSync(path.join(root, ".openai", "hosting.json"), path.join(dist, ".openai", "hosting.json"));
+fs.cpSync(path.join(root, "drizzle"), path.join(dist, ".openai", "drizzle"), { recursive: true });
 console.log("Built Cloudflare Worker artifact");
