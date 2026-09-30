@@ -81,6 +81,73 @@ async function activateSession(request, env) {
   return json({ session: { sessionKey, label, createdAt: existing?.createdAt || now } });
 }
 
+function timerSnapshot(row, nowMs = Date.now()) {
+  const durationSeconds = Math.max(60, Number(row?.durationSeconds) || 2700);
+  const storedRemaining = Math.max(0, row?.remainingSeconds == null ? durationSeconds : Number(row.remainingSeconds));
+  const wasRunning = Boolean(row?.isRunning);
+  const startedMs = row?.startedAt ? Date.parse(row.startedAt) : NaN;
+  const elapsed = wasRunning && Number.isFinite(startedMs) ? Math.max(0, Math.floor((nowMs - startedMs) / 1000)) : 0;
+  const remainingSeconds = Math.max(0, storedRemaining - elapsed);
+  return { durationSeconds, remainingSeconds, isRunning: wasRunning && remainingSeconds > 0, startedAt: row?.startedAt || null };
+}
+
+async function readTimer(sessionKey, env) {
+  const row = await env.DB.prepare(`
+    SELECT duration_seconds AS durationSeconds, remaining_seconds AS remainingSeconds,
+      is_running AS isRunning, started_at AS startedAt, updated_at AS updatedAt
+    FROM class_timers WHERE session_key = ?
+  `).bind(sessionKey).first();
+  return timerSnapshot(row);
+}
+
+async function getTimer(url, env) {
+  const sessionKey = url.searchParams.get("session") || "";
+  if (!validSession(sessionKey)) return json({ error: "수업 회차를 확인해 주세요." }, 400);
+  return json({ ...(await readTimer(sessionKey, env)), serverTime: new Date().toISOString() });
+}
+
+async function setTimer(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "요청 형식을 확인해 주세요." }, 400); }
+  const sessionKey = String(body.sessionKey || "");
+  const action = String(body.action || "");
+  if (!validSession(sessionKey) || !["start", "pause", "add", "reset"].includes(action)) {
+    return json({ error: "타이머 요청을 확인해 주세요." }, 400);
+  }
+  const current = await readTimer(sessionKey, env);
+  const durationSeconds = current.durationSeconds || 2700;
+  let remainingSeconds = current.remainingSeconds;
+  let isRunning = current.isRunning;
+  let startedAt = current.startedAt;
+  const now = new Date().toISOString();
+  if (action === "start") {
+    remainingSeconds = remainingSeconds > 0 ? remainingSeconds : durationSeconds;
+    isRunning = true;
+    startedAt = now;
+  } else if (action === "pause") {
+    isRunning = false;
+    startedAt = null;
+  } else if (action === "add") {
+    remainingSeconds += 300;
+    startedAt = isRunning ? now : null;
+  } else if (action === "reset") {
+    remainingSeconds = durationSeconds;
+    isRunning = false;
+    startedAt = null;
+  }
+  await env.DB.prepare(`
+    INSERT INTO class_timers (session_key, duration_seconds, remaining_seconds, is_running, started_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(session_key) DO UPDATE SET
+      duration_seconds = excluded.duration_seconds,
+      remaining_seconds = excluded.remaining_seconds,
+      is_running = excluded.is_running,
+      started_at = excluded.started_at,
+      updated_at = excluded.updated_at
+  `).bind(sessionKey, durationSeconds, remainingSeconds, isRunning ? 1 : 0, startedAt, now).run();
+  return json({ durationSeconds, remainingSeconds, isRunning, startedAt, serverTime: now });
+}
+
 function teacherAuthorized(request, env) {
   const provided = request.headers.get("x-teacher-code") || "";
   return Boolean(env.TEACHER_CODE) && provided === env.TEACHER_CODE;
@@ -176,6 +243,11 @@ export default {
       if (url.pathname === "/api/sessions" && request.method === "PATCH") {
         const denied = requireTeacher(request, env);
         return denied || await activateSession(request, env);
+      }
+      if (url.pathname === "/api/timer" && request.method === "GET") return await getTimer(url, env);
+      if (url.pathname === "/api/timer" && request.method === "POST") {
+        const denied = requireTeacher(request, env);
+        return denied || await setTimer(request, env);
       }
       if (url.pathname === "/api/responses" && request.method === "POST") return await saveResponse(request, env);
       if (url.pathname === "/api/teacher/verify" && request.method === "POST") {

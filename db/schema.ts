@@ -29,3 +29,12 @@ export const classSessions = sqliteTable("class_sessions", {
 }, (table) => ({
   activeUpdated: index("idx_class_sessions_active_updated").on(table.isActive, table.updatedAt),
 }));
+
+export const classTimers = sqliteTable("class_timers", {
+  sessionKey: text("session_key").primaryKey(),
+  durationSeconds: integer("duration_seconds").notNull().default(2700),
+  remainingSeconds: integer("remaining_seconds").notNull().default(2700),
+  isRunning: integer("is_running").notNull().default(0),
+  startedAt: text("started_at"),
+  updatedAt: text("updated_at").notNull(),
+});
