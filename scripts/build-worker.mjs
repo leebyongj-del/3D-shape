@@ -3,6 +3,9 @@ import path from "node:path";
 
 const root = process.cwd();
 const html = fs.readFileSync(path.join(root, "site", "index.html"), "utf8");
+if (html.includes("$$")) {
+  throw new Error("The Sites publishing pipeline rewrites '$$'. Use a named selector helper instead.");
+}
 const qr = fs.readFileSync(path.join(root, "site", "qr-code.png")).toString("base64");
 let worker = fs.readFileSync(path.join(root, "worker", "index.js"), "utf8");
 worker = worker.replace('"__SITE_PAGE_JSON__"', JSON.stringify(html));
