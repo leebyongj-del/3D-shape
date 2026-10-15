@@ -20,6 +20,14 @@ function validSession(value) {
   return typeof value === "string" && /^\d{8}(?:-[a-z0-9]{6})?$/.test(value);
 }
 
+function validJoinCode(value) {
+  return typeof value === "string" && /^\d{4,8}$/.test(value);
+}
+
+function validParticipantId(value) {
+  return typeof value === "string" && /^[a-zA-Z0-9_-]{8,80}$/.test(value);
+}
+
 function todaySessionKey() {
   return new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit" })
     .format(new Date()).replaceAll("-", "");
@@ -51,14 +59,80 @@ async function createSession(request, env) {
   let body;
   try { body = await request.json(); } catch { return json({ error: "요청 형식을 확인해 주세요." }, 400); }
   const label = String(body.label || "").trim().replace(/\s+/g, " ").slice(0, 40);
+  const joinCode = String(body.joinCode || "").trim();
   if (label.length < 2) return json({ error: "수업 회차 이름을 두 글자 이상 입력해 주세요." }, 400);
+  if (!validJoinCode(joinCode)) return json({ error: "학생용 수업 코드는 숫자 4~8자리로 설정해 주세요." }, 400);
   const sessionKey = `${todaySessionKey()}-${crypto.randomUUID().replaceAll("-", "").slice(0, 6)}`;
   const now = new Date().toISOString();
   await env.DB.batch([
     env.DB.prepare("UPDATE class_sessions SET is_active = 0, updated_at = ? WHERE is_active = 1").bind(now),
     env.DB.prepare("INSERT INTO class_sessions (session_key, label, is_active, created_at, updated_at) VALUES (?, ?, 1, ?, ?)").bind(sessionKey, label, now, now),
+    env.DB.prepare("INSERT INTO session_access (session_key, join_code, updated_at) VALUES (?, ?, ?)").bind(sessionKey, joinCode, now),
   ]);
-  return json({ session: { sessionKey, label, createdAt: now } }, 201);
+  return json({ session: { sessionKey, label, joinCode, createdAt: now } }, 201);
+}
+
+async function setJoinCode(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "요청 형식을 확인해 주세요." }, 400); }
+  const sessionKey = String(body.sessionKey || "");
+  const joinCode = String(body.joinCode || "").trim();
+  if (!validSession(sessionKey) || !validJoinCode(joinCode)) return json({ error: "수업 코드와 회차를 확인해 주세요." }, 400);
+  const now = new Date().toISOString();
+  await env.DB.prepare(`
+    INSERT INTO session_access (session_key, join_code, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(session_key) DO UPDATE SET join_code = excluded.join_code, updated_at = excluded.updated_at
+  `).bind(sessionKey, joinCode, now).run();
+  return json({ sessionKey, joinCode, updatedAt: now });
+}
+
+async function getJoinCode(url, env) {
+  const sessionKey = url.searchParams.get("session") || "";
+  if (!validSession(sessionKey)) return json({ error: "수업 회차를 확인해 주세요." }, 400);
+  const row = await env.DB.prepare("SELECT join_code AS joinCode, updated_at AS updatedAt FROM session_access WHERE session_key = ?").bind(sessionKey).first();
+  return json(row || { joinCode: "", updatedAt: null });
+}
+
+async function verifyStudentCode(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "요청 형식을 확인해 주세요." }, 400); }
+  const code = String(body.code || "").trim();
+  if (!validJoinCode(code)) return json({ error: "수업 코드는 숫자 4~8자리입니다." }, 400);
+  const session = await currentSession(env);
+  const access = await env.DB.prepare("SELECT join_code AS joinCode FROM session_access WHERE session_key = ?").bind(session.sessionKey).first();
+  if (!access || access.joinCode !== code) return json({ error: "현재 수업의 코드가 아닙니다. 선생님께 확인해 주세요." }, 401);
+  return json({ verified: true, session });
+}
+
+async function saveStudentProgress(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "요청 형식을 확인해 주세요." }, 400); }
+  const sessionKey = String(body.sessionKey || "");
+  const code = String(body.code || "").trim();
+  const participantId = String(body.participantId || "");
+  const displayName = String(body.displayName || "").trim().replace(/\s+/g, " ").slice(0, 20);
+  const groupNo = Number(body.groupNo);
+  const currentStage = Number(body.currentStage);
+  const progressPercent = Number(body.progressPercent);
+  const isComplete = Boolean(body.isComplete);
+  if (!validSession(sessionKey) || !validJoinCode(code) || !validParticipantId(participantId) || displayName.length < 1 || !Number.isInteger(groupNo) || groupNo < 1 || groupNo > 8 || !Number.isInteger(currentStage) || currentStage < 1 || currentStage > 4 || !Number.isInteger(progressPercent) || progressPercent < 0 || progressPercent > 100) {
+    return json({ error: "학생 정보와 진행 상태를 확인해 주세요." }, 400);
+  }
+  const access = await env.DB.prepare("SELECT 1 AS ok FROM session_access WHERE session_key = ? AND join_code = ?").bind(sessionKey, code).first();
+  if (!access) return json({ error: "수업 코드가 만료되었거나 맞지 않습니다." }, 401);
+  const now = new Date().toISOString();
+  await env.DB.prepare(`
+    INSERT INTO student_progress (session_key, participant_id, group_no, display_name, current_stage, progress_percent, is_complete, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(session_key, participant_id) DO UPDATE SET
+      group_no = excluded.group_no,
+      display_name = excluded.display_name,
+      current_stage = excluded.current_stage,
+      progress_percent = MAX(student_progress.progress_percent, excluded.progress_percent),
+      is_complete = MAX(student_progress.is_complete, excluded.is_complete),
+      updated_at = excluded.updated_at
+  `).bind(sessionKey, participantId, groupNo, displayName, currentStage, progressPercent, isComplete ? 1 : 0, now).run();
+  return json({ saved: true, currentStage, progressPercent, isComplete, updatedAt: now });
 }
 
 async function activateSession(request, env) {
@@ -194,14 +268,27 @@ async function getResponses(url, env) {
   const responses = result.results || [];
   const groups = [...new Set(responses.map((row) => row.groupNo))];
   const correct = responses.filter((row) => row.isCorrect).length;
-  return json({ responses, summary: { groups: groups.length, submissions: responses.length, correct } });
+  const progressResult = await env.DB.prepare(`
+    SELECT participant_id AS participantId, group_no AS groupNo, display_name AS displayName,
+      current_stage AS currentStage, progress_percent AS progressPercent,
+      is_complete AS isComplete, updated_at AS updatedAt
+    FROM student_progress WHERE session_key = ?
+    ORDER BY group_no ASC, display_name ASC
+  `).bind(sessionKey).all();
+  const participants = progressResult.results || [];
+  const progressGroups = [...new Set(participants.map((row) => row.groupNo))];
+  const averageProgress = participants.length ? Math.round(participants.reduce((sum, row) => sum + Number(row.progressPercent || 0), 0) / participants.length) : 0;
+  return json({ responses, participants, summary: { groups: progressGroups.length || groups.length, submissions: responses.length, correct, students: participants.length, averageProgress } });
 }
 
 async function deleteResponses(url, env) {
   const sessionKey = url.searchParams.get("session") || "";
   if (!validSession(sessionKey)) return json({ error: "수업 날짜를 확인해 주세요." }, 400);
-  const result = await env.DB.prepare("DELETE FROM responses WHERE session_key = ?").bind(sessionKey).run();
-  return json({ deleted: true, changes: result.meta?.changes || 0 });
+  const [responses, progress] = await env.DB.batch([
+    env.DB.prepare("DELETE FROM responses WHERE session_key = ?").bind(sessionKey),
+    env.DB.prepare("DELETE FROM student_progress WHERE session_key = ?").bind(sessionKey),
+  ]);
+  return json({ deleted: true, changes: (responses.meta?.changes || 0) + (progress.meta?.changes || 0) });
 }
 
 async function getClassState(url, env) {
@@ -244,6 +331,16 @@ export default {
         const denied = requireTeacher(request, env);
         return denied || await activateSession(request, env);
       }
+      if (url.pathname === "/api/session-code" && request.method === "GET") {
+        const denied = requireTeacher(request, env);
+        return denied || await getJoinCode(url, env);
+      }
+      if (url.pathname === "/api/session-code" && request.method === "POST") {
+        const denied = requireTeacher(request, env);
+        return denied || await setJoinCode(request, env);
+      }
+      if (url.pathname === "/api/student/verify" && request.method === "POST") return await verifyStudentCode(request, env);
+      if (url.pathname === "/api/student/progress" && request.method === "POST") return await saveStudentProgress(request, env);
       if (url.pathname === "/api/timer" && request.method === "GET") return await getTimer(url, env);
       if (url.pathname === "/api/timer" && request.method === "POST") {
         const denied = requireTeacher(request, env);

@@ -38,3 +38,24 @@ export const classTimers = sqliteTable("class_timers", {
   startedAt: text("started_at"),
   updatedAt: text("updated_at").notNull(),
 });
+
+export const sessionAccess = sqliteTable("session_access", {
+  sessionKey: text("session_key").primaryKey(),
+  joinCode: text("join_code").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
+export const studentProgress = sqliteTable("student_progress", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  sessionKey: text("session_key").notNull(),
+  participantId: text("participant_id").notNull(),
+  groupNo: integer("group_no").notNull(),
+  displayName: text("display_name").notNull(),
+  currentStage: integer("current_stage").notNull().default(1),
+  progressPercent: integer("progress_percent").notNull().default(0),
+  isComplete: integer("is_complete").notNull().default(0),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => ({
+  sessionParticipant: uniqueIndex("idx_student_progress_session_participant").on(table.sessionKey, table.participantId),
+  sessionGroup: index("idx_student_progress_session_group").on(table.sessionKey, table.groupNo),
+}));
